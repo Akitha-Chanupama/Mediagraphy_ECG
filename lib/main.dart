@@ -2,11 +2,14 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
+import 'dart:io';
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:bluetooth_classic/bluetooth_classic.dart';
 import 'package:bluetooth_classic/models/device.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'package:path_provider/path_provider.dart';
 
 void main() {
   runApp(const ECGApp());
@@ -108,9 +111,9 @@ class ECGData {
   }
 }
 
-/// Enhanced Constants - FIXED ECG TIMING
+/// Enhanced Constants
 const double samplingRate = 250.0; // Hz - confirmed for most ECG devices
-const double timeWindowSeconds = 10.0; // Show 10 seconds of ECG data
+const double timeWindowSeconds = 10.0;
 final int samplesWindow = (samplingRate * timeWindowSeconds).round();
 
 // Calibration constants - more accurate for medical ECG
@@ -118,10 +121,10 @@ const double defaultRawToMv =
     0.00488; // 4.88 µV per LSB (typical for 12-bit ADC)
 const double ecgGainFactor = 1.0; // Remove the arbitrary *2 multiplication
 
-// ECG paper standards - CORRECTED VALUES
+// ECG paper standards
 const double mmPerSecond = 25.0; // 25 mm/s standard paper speed
 const double mmPerMv = 10.0; // 10 mm per 1 mV standard
-double pixelsPerMmDefault = 5.0; // INCREASED from 4.0 to reduce compression
+double pixelsPerMmDefault = 4.0;
 
 /// Proper 16-bit signed conversion
 int toSigned16(int msb, int lsb) {
@@ -143,6 +146,111 @@ class BluetoothService {
   Future<void> disconnect() => _bt.disconnect();
   Future<void> write(String cmd) => _bt.write(cmd);
   Stream<Uint8List> onDataReceived() => _bt.onDeviceDataReceived();
+}
+
+/// ECG JSON Recorder - Streams ECGData to a JSON file on device storage
+class ECGRecorder {
+  IOSink? _sink;
+  File? _file;
+  bool _isFirst = true;
+  bool _isRecording = false;
+  String? _currentFilePath;
+
+  bool get isRecording => _isRecording;
+  String? get currentFilePath => _currentFilePath;
+
+  Future<void> start({
+    required double samplingRateHz,
+    required double calibrationUvPerCount,
+    required int gain,
+    String? deviceName,
+    String? deviceAddress,
+  }) async {
+    await stop();
+
+    Directory dir;
+    try {
+      if (Platform.isAndroid) {
+        final dirs = await getExternalStorageDirectories(
+          type: StorageDirectory.downloads,
+        );
+        if (dirs != null && dirs.isNotEmpty) {
+          dir = dirs.first;
+        } else {
+          dir = await getApplicationDocumentsDirectory();
+        }
+      } else {
+        dir = await getApplicationDocumentsDirectory();
+      }
+    } catch (_) {
+      dir = await getApplicationDocumentsDirectory();
+    }
+    final String ts = DateTime.now().toIso8601String().replaceAll(':', '-');
+    final String filename = 'ecg_recording_$ts.json';
+    _file = File('${dir.path}/$filename');
+    _currentFilePath = _file!.path;
+    _sink = _file!.openWrite(mode: FileMode.writeOnly);
+
+    // Write header and open records array
+    final header = {
+      'schema': 'ecg.v1',
+      'createdAt': DateTime.now().toIso8601String(),
+      'device': {'name': deviceName, 'address': deviceAddress},
+      'samplingRateHz': samplingRateHz,
+      'calibrationUvPerCount': calibrationUvPerCount * 1e6,
+      'gain': gain,
+    };
+    final headerJson = jsonEncode(header);
+    final openHeader = headerJson.endsWith('}')
+        ? headerJson.substring(0, headerJson.length - 1)
+        : headerJson;
+    _sink!.write('$openHeader,"records":[');
+    _isFirst = true;
+    _isRecording = true;
+  }
+
+  void add(ECGData d) {
+    if (!_isRecording || _sink == null) return;
+    final rec = {
+      't': d.timestamp.toIso8601String(),
+      'I': d.leadI,
+      'II': d.leadII,
+      'V1': d.leadV1,
+      'V2': d.leadV2,
+      'V3': d.leadV3,
+      'V4': d.leadV4,
+      'V5': d.leadV5,
+      'V6': d.leadV6,
+      'aVR': d.aVR,
+      'aVL': d.aVL,
+      'aVF': d.aVF,
+      'status1': d.status1,
+      'status2': d.status2,
+      'status3': d.status3,
+      'battery': d.batteryLevel & 0x0F,
+    };
+    if (_isFirst) {
+      _sink!.write(jsonEncode(rec));
+      _isFirst = false;
+    } else {
+      _sink!.write(',');
+      _sink!.write(jsonEncode(rec));
+    }
+  }
+
+  Future<void> stop() async {
+    if (_sink != null) {
+      try {
+        _sink!.write(']}');
+        await _sink!.flush();
+      } catch (_) {}
+      await _sink!.close();
+    }
+    _sink = null;
+    _file = null;
+    _isRecording = false;
+    _isFirst = true;
+  }
 }
 
 /// Enhanced ECG Parser with Better Validation
@@ -242,7 +350,7 @@ class ECGParser {
     int v5 = toSigned16(pkt[16], pkt[17]);
     int v1 = toSigned16(pkt[18], pkt[19]);
 
-    // Calculate augmented leads correctly - FIXED FORMULA
+    // Calculate augmented leads correctly
     final avr = -(i + ii) ~/ 2;
     final avl = i - (ii ~/ 2);
     final avf = ii - (i ~/ 2);
@@ -337,20 +445,18 @@ class ECGParser {
   void dispose() => _out.close();
 }
 
-/// Enhanced Digital Filters - IMPROVED COEFFICIENTS
+/// Enhanced Digital Filters
 class HighPassFilter {
   final double alpha;
   double _y = 0.0;
   double _xPrev = 0.0;
-  double _yPrev = 0.0;
 
   HighPassFilter(double cutoffHz, double sampleRateHz)
-    : alpha = 1.0 / (1.0 + (2.0 * pi * cutoffHz) / sampleRateHz);
+    : alpha = sampleRateHz / (sampleRateHz + 2 * pi * cutoffHz);
 
   double process(double x) {
-    _y = alpha * (_yPrev + x - _xPrev);
+    _y = alpha * (_y + x - _xPrev);
     _xPrev = x;
-    _yPrev = _y;
     return _y;
   }
 }
@@ -358,13 +464,16 @@ class HighPassFilter {
 class LowPassFilter {
   final double alpha;
   double _y = 0.0;
+  double _xPrev = 0.0;
 
   LowPassFilter(double cutoffHz, double sampleRateHz)
     : alpha = (2 * pi * cutoffHz) / (sampleRateHz + 2 * pi * cutoffHz);
 
   double process(double x) {
-    _y = alpha * x + (1 - alpha) * _y;
-    return _y;
+    final y = alpha * x + (1 - alpha) * _y;
+    _xPrev = x;
+    _y = y;
+    return y;
   }
 }
 
@@ -418,22 +527,20 @@ class ECGFilterChain {
   }
 }
 
-/// Enhanced Waveform Controller - FIXED TIMING AND DATA MANAGEMENT
+/// Enhanced Waveform Controller
 class WaveformController {
   final Map<String, ECGFilterChain> filters = {};
   final Map<String, ListQueue<double>> leadBuffers = {};
-  final Map<String, DateTime> lastSampleTimes = {};
   final ValueNotifier<int> tick = ValueNotifier<int>(0);
 
   double rawToMv = defaultRawToMv;
   int currentGain = 1;
   Timer? _uiTimer;
 
-  // Statistics - IMPROVED TRACKING
+  // Statistics
   int _samplesProcessed = 0;
   DateTime? _firstSampleTime;
   double _actualSampleRate = 0.0;
-  final List<DateTime> _recentSampleTimes = [];
 
   WaveformController() {
     _initializeFiltersAndBuffers();
@@ -460,18 +567,16 @@ class WaveformController {
       filters[lead] = ECGFilterChain(
         sampleRate: samplingRate,
         enableNotch: true,
-        highPassCutoff: 0.05, // Lower cutoff to preserve ST segments
-        lowPassCutoff: 100.0, // Higher cutoff for better signal fidelity
+        highPassCutoff: 0.5, // Remove baseline drift
+        lowPassCutoff: 40.0, // Anti-aliasing and noise reduction
         notchFreq: 50.0, // Power line interference
       );
       leadBuffers[lead] = ListQueue<double>();
-      lastSampleTimes[lead] = DateTime.now();
     }
   }
 
   void _startUITimer() {
-    // REDUCED UI update frequency for better performance
-    _uiTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+    _uiTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
       tick.value++;
     });
   }
@@ -504,24 +609,23 @@ class WaveformController {
       final lead = entry.key;
       final rawValue = entry.value;
 
-      // Convert to mV with proper calibration - IMPROVED CONVERSION
-      final mvRaw = (rawValue * rawToMv) / max(1, currentGain);
+      // Convert to mV with proper calibration
+      final mvRaw = (rawValue * rawToMv * ecgGainFactor) / max(1, currentGain);
 
       // Apply filtering
       final mvFiltered = filters[lead]!.process(mvRaw);
 
-      // Validate filtered result - RELAXED VALIDATION
-      if (mvFiltered.isFinite && mvFiltered.abs() < 50.0) {
-        // Extended range ±50mV for abnormal ECG patterns
+      // Validate filtered result
+      if (mvFiltered.isFinite && mvFiltered.abs() < 20.0) {
+        // Typical ECG range ±20mV
         leadBuffers[lead]!.add(mvFiltered);
-        lastSampleTimes[lead] = DateTime.now();
       } else {
         // Add zero for invalid samples to maintain timing
         leadBuffers[lead]!.add(0.0);
       }
 
-      // Maintain buffer size - FIXED WINDOW MANAGEMENT
-      while (leadBuffers[lead]!.length > samplesWindow) {
+      // Maintain buffer size
+      if (leadBuffers[lead]!.length > samplesWindow) {
         leadBuffers[lead]!.removeFirst();
       }
     }
@@ -529,23 +633,12 @@ class WaveformController {
 
   void _updateSampleStatistics() {
     _samplesProcessed++;
-    final now = DateTime.now();
-    _recentSampleTimes.add(now);
-    _firstSampleTime ??= now;
+    _firstSampleTime ??= DateTime.now();
 
-    // Keep only recent samples for rate calculation
-    _recentSampleTimes.removeWhere(
-      (time) => now.difference(time).inMilliseconds > 2000,
-    );
-
-    if (_recentSampleTimes.length > 10) {
-      final duration = _recentSampleTimes.last
-          .difference(_recentSampleTimes.first)
-          .inMilliseconds;
-      if (duration > 0) {
-        _actualSampleRate =
-            (_recentSampleTimes.length - 1) / (duration / 1000.0);
-      }
+    final elapsed = DateTime.now().difference(_firstSampleTime!).inMilliseconds;
+    if (elapsed > 1000) {
+      // Update every second
+      _actualSampleRate = _samplesProcessed / (elapsed / 1000.0);
     }
   }
 
@@ -560,7 +653,6 @@ class WaveformController {
     _samplesProcessed = 0;
     _firstSampleTime = null;
     _actualSampleRate = 0.0;
-    _recentSampleTimes.clear();
     tick.value++;
   }
 
@@ -570,7 +662,7 @@ class WaveformController {
   }
 }
 
-/// Enhanced ECG Paper Painter - FIXED SCALING AND TIMING
+/// Enhanced ECG Paper Painter
 class ECGPaperPainter extends CustomPainter {
   final List<double> samples;
   final Color lineColor;
@@ -657,49 +749,36 @@ class ECGPaperPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
 
     final centerY = size.height / 2.0;
-
-    // CORRECTED SCALING - This fixes the horizontal compression
     final pixelsPerSecond = mmPerSecLocal * pmm;
     final pixelsPerSample = pixelsPerSecond / samplingRateLocal;
     final pixelsPerMv = mmPerMv * pmm;
 
-    // Calculate the time window we want to show (in seconds)
-    final timeWindowToShow = min(
-      timeWindowSeconds,
-      size.width / pixelsPerSecond,
-    );
-    final samplesToShow = (timeWindowToShow * samplingRateLocal).round();
-
     final path = Path();
     bool pathStarted = false;
 
-    // Always start from the most recent samples for real-time display
-    final startIndex = max(0, samples.length - samplesToShow);
+    // Calculate visible sample range
+    final maxVisibleSamples = (size.width / pixelsPerSample).ceil();
+    final startIndex = max(0, samples.length - maxVisibleSamples);
 
     for (int i = startIndex; i < samples.length; i++) {
       final sampleIndex = i - startIndex;
       final mv = samples[i];
-
-      // FIXED TIMING: Each sample is properly spaced based on sample rate
       final x = sampleIndex * pixelsPerSample;
       final y = centerY - (mv * pixelsPerMv);
 
-      // Clamp to visible area with proper bounds checking
-      if (x >= 0 && x <= size.width) {
-        final clampedY = y.clamp(0.0, size.height);
+      // Clamp to visible area
+      final clampedX = x.clamp(0.0, size.width);
+      final clampedY = y.clamp(0.0, size.height);
 
-        if (!pathStarted) {
-          path.moveTo(x, clampedY);
-          pathStarted = true;
-        } else {
-          path.lineTo(x, clampedY);
-        }
+      if (!pathStarted) {
+        path.moveTo(clampedX, clampedY);
+        pathStarted = true;
+      } else {
+        path.lineTo(clampedX, clampedY);
       }
     }
 
-    if (pathStarted) {
-      canvas.drawPath(path, waveformPaint);
-    }
+    canvas.drawPath(path, waveformPaint);
 
     // Draw baseline reference
     final baselinePaint = Paint()
@@ -710,37 +789,6 @@ class ECGPaperPainter extends CustomPainter {
       Offset(size.width, centerY),
       baselinePaint,
     );
-
-    // Draw amplitude markers
-    _drawAmplitudeMarkers(canvas, size, centerY, pixelsPerMv);
-  }
-
-  void _drawAmplitudeMarkers(
-    Canvas canvas,
-    Size size,
-    double centerY,
-    double pixelsPerMv,
-  ) {
-    final markerPaint = Paint()
-      ..color = Colors.grey.withOpacity(0.5)
-      ..strokeWidth = 0.8;
-
-    final textStyle = TextStyle(color: Colors.grey.shade600, fontSize: 10);
-
-    // Draw 1mV and -1mV markers
-    for (int mv in [-1, 1]) {
-      final y = centerY - (mv * pixelsPerMv);
-      if (y >= 0 && y <= size.height) {
-        canvas.drawLine(Offset(0, y), Offset(size.width, y), markerPaint);
-
-        final textPainter = TextPainter(
-          text: TextSpan(text: '${mv}mV', style: textStyle),
-          textDirection: TextDirection.ltr,
-        );
-        textPainter.layout();
-        textPainter.paint(canvas, Offset(4, y - 8));
-      }
-    }
   }
 
   void _drawNoDataMessage(Canvas canvas, Size size) {
@@ -768,7 +816,7 @@ class ECGPaperPainter extends CustomPainter {
         style: TextStyle(
           color: lineColor.withOpacity(0.8),
           fontWeight: FontWeight.bold,
-          fontSize: 16, // Increased font size
+          fontSize: 14,
         ),
       ),
       textDirection: TextDirection.ltr,
@@ -780,7 +828,7 @@ class ECGPaperPainter extends CustomPainter {
   void _drawCalibrationPulse(Canvas canvas, Size size) {
     final calibrationPaint = Paint()
       ..color = Colors.black87
-      ..strokeWidth = 2.5
+      ..strokeWidth = 2.0
       ..style = PaintingStyle.stroke;
 
     final startY = size.height * 0.8;
@@ -799,12 +847,8 @@ class ECGPaperPainter extends CustomPainter {
     // Label the calibration pulse
     final labelPainter = TextPainter(
       text: const TextSpan(
-        text: '1mV Cal',
-        style: TextStyle(
-          color: Colors.black87,
-          fontSize: 11,
-          fontWeight: FontWeight.bold,
-        ),
+        text: '1mV',
+        style: TextStyle(color: Colors.black87, fontSize: 10),
       ),
       textDirection: TextDirection.ltr,
     );
@@ -820,7 +864,7 @@ class ECGPaperPainter extends CustomPainter {
   }
 }
 
-/// ECG Chart Widget - IMPROVED PERFORMANCE
+/// ECG Chart Widget
 class ECGChart extends StatelessWidget {
   final String leadName;
   final List<double> samples;
@@ -877,6 +921,7 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
   final BluetoothService btService = BluetoothService();
   final ECGParser parser = ECGParser();
   final WaveformController waveController = WaveformController();
+  final ECGRecorder recorder = ECGRecorder();
 
   List<Device> devices = [];
   Device? connectedDevice;
@@ -885,12 +930,14 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
   StreamSubscription<ECGData>? _ecgSub;
 
   bool isAcquiring = false;
+  bool isRecording = false;
   String statusMessage = 'Disconnected';
   int currentGain = 1;
   double calibration = defaultRawToMv;
   String selectedLead = 'II';
   late TabController tabController;
   ECGData? lastECGData;
+  String? lastSavedFilePath;
 
   bool useMock = false;
   Timer? _mockTimer;
@@ -920,6 +967,9 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
       _ecgSub = parser.stream.listen((ecgData) {
         lastECGData = ecgData;
         waveController.addECGData(ecgData);
+        if (recorder.isRecording) {
+          recorder.add(ecgData);
+        }
       });
 
       await btService.startScan();
@@ -937,6 +987,12 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
     waveController.dispose();
     tabController.dispose();
     _mockTimer?.cancel();
+    // Ensure recorder is closed
+    () async {
+      try {
+        await recorder.stop();
+      } catch (_) {}
+    }();
     super.dispose();
   }
 
@@ -980,6 +1036,12 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
 
   Future<void> _disconnect() async {
     if (isAcquiring) await _stopAcquisition();
+    if (isRecording) {
+      try {
+        await recorder.stop();
+      } catch (_) {}
+      setState(() => isRecording = false);
+    }
 
     try {
       await btService.disconnect();
@@ -1004,12 +1066,12 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
     waveController.setRawToMv(calibration);
 
     try {
-      // IMPROVED COMMAND SEQUENCE with proper timing
+      // Send proper command sequence for ECG device
       await btService.write('S'); // Stop
-      await Future.delayed(const Duration(milliseconds: 500));
+      await Future.delayed(const Duration(milliseconds: 300));
 
       await btService.write('R'); // Reset
-      await Future.delayed(const Duration(milliseconds: 500));
+      await Future.delayed(const Duration(milliseconds: 300));
 
       // Set gain based on current selection
       final gainCommands = {
@@ -1024,7 +1086,7 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
 
       final gainCmd = gainCommands[currentGain] ?? 'B';
       await btService.write(gainCmd);
-      await Future.delayed(const Duration(milliseconds: 500));
+      await Future.delayed(const Duration(milliseconds: 300));
 
       await btService.write('A'); // Start acquisition
 
@@ -1049,6 +1111,83 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
     }
   }
 
+  Future<void> _startRecording() async {
+    try {
+      await recorder.start(
+        samplingRateHz: samplingRate,
+        calibrationUvPerCount: calibration,
+        gain: currentGain,
+        deviceName: connectedDevice?.name,
+        deviceAddress: connectedDevice?.address,
+      );
+      setState(() {
+        isRecording = true;
+        lastSavedFilePath = recorder.currentFilePath;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Recording to ${recorder.currentFilePath}')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Recording start error: $e')));
+      }
+    }
+  }
+
+  Future<void> _stopRecording({bool showSnackbar = true}) async {
+    try {
+      final path = recorder.currentFilePath;
+      await recorder.stop();
+      setState(() {
+        isRecording = false;
+        if (path != null) lastSavedFilePath = path;
+      });
+      // Attempt to copy to public Downloads on Android for easier access
+      if (path != null && Platform.isAndroid) {
+        try {
+          final source = File(path);
+          final downloads = Directory('/storage/emulated/0/Download');
+          if (await downloads.exists()) {
+            final outFile = File(
+              '${downloads.path}/${source.uri.pathSegments.last}',
+            );
+            await outFile.writeAsBytes(await source.readAsBytes(), flush: true);
+            lastSavedFilePath = outFile.path;
+            if (mounted && showSnackbar) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Saved to Downloads: ${outFile.path}')),
+              );
+            }
+          } else if (mounted && showSnackbar) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('Saved: $path')));
+          }
+        } catch (_) {
+          if (mounted && showSnackbar) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('Saved: $path')));
+          }
+        }
+      } else if (showSnackbar && mounted && path != null) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Saved ECG JSON to $path')));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Recording stop error: $e')));
+      }
+    }
+  }
+
   void _startMockData() {
     _mockTimer?.cancel();
 
@@ -1056,57 +1195,49 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
     final dt = 1.0 / fs;
     double t = 0.0;
     final rng = Random();
-    const hrBpm = 72.0; // More realistic heart rate
 
-    // IMPROVED MOCK DATA with more realistic ECG morphology
     _mockTimer = Timer.periodic(Duration(microseconds: (1e6 / fs).round()), (
       _,
     ) {
       // Generate realistic ECG-like signal
+      final hrBpm = 75.0;
       final rrInterval = 60.0 / hrBpm;
       final phase = (t % rrInterval) / rrInterval;
 
       // Enhanced ECG morphology with proper P, QRS, T waves
       double ecgSignal = 0.0;
 
-      // P wave (0.08-0.12s duration)
+      // P wave (0.08-0.12s)
       if (phase >= 0.15 && phase <= 0.25) {
-        final pPhase = (phase - 0.15) / 0.10;
-        ecgSignal += 0.2 * sin(pi * pPhase) * exp(-pow(pPhase - 0.5, 2) / 0.1);
+        ecgSignal += 0.15 * exp(-pow((phase - 0.20) / 0.025, 2));
       }
 
-      // QRS complex (0.06-0.10s duration)
+      // QRS complex (0.06-0.10s)
       if (phase >= 0.35 && phase <= 0.45) {
-        final qrsPhase = (phase - 0.35) / 0.10;
-        // Q wave (negative deflection)
-        if (qrsPhase <= 0.2) {
-          ecgSignal += -0.15 * sin(5 * pi * qrsPhase);
+        // Q wave (negative)
+        if (phase >= 0.35 && phase <= 0.37) {
+          ecgSignal += -0.2 * exp(-pow((phase - 0.36) / 0.005, 2));
         }
-        // R wave (positive dominant deflection)
-        else if (qrsPhase <= 0.6) {
-          final rPhase = (qrsPhase - 0.2) / 0.4;
-          ecgSignal +=
-              1.2 * sin(pi * rPhase) * exp(-pow(rPhase - 0.5, 2) / 0.1);
+        // R wave (positive, dominant)
+        else if (phase >= 0.37 && phase <= 0.41) {
+          ecgSignal += 1.2 * exp(-pow((phase - 0.39) / 0.008, 2));
         }
-        // S wave (negative deflection)
-        else {
-          final sPhase = (qrsPhase - 0.6) / 0.4;
-          ecgSignal += -0.25 * sin(pi * sPhase);
+        // S wave (negative)
+        else if (phase >= 0.41 && phase <= 0.44) {
+          ecgSignal += -0.3 * exp(-pow((phase - 0.42) / 0.008, 2));
         }
       }
 
-      // T wave (0.15-0.25s duration)
+      // T wave (0.15-0.25s)
       if (phase >= 0.60 && phase <= 0.85) {
-        final tPhase = (phase - 0.60) / 0.25;
-        ecgSignal += 0.35 * sin(pi * tPhase) * exp(-pow(tPhase - 0.5, 2) / 0.2);
+        ecgSignal += 0.3 * exp(-pow((phase - 0.72) / 0.06, 2));
       }
 
-      // Add realistic physiological variations
-      ecgSignal += 0.02 * sin(2 * pi * 0.3 * t); // Respiratory modulation
-      ecgSignal += 0.01 * sin(2 * pi * 0.1 * t); // Baseline wander
-      ecgSignal += (rng.nextDouble() - 0.5) * 0.015; // Random noise
+      // Add realistic noise and baseline wander
+      ecgSignal += 0.02 * sin(2 * pi * 0.3 * t); // Respiratory artifact
+      ecgSignal += (rng.nextDouble() - 0.5) * 0.02; // Random noise
 
-      // Generate lead-specific variations with proper scaling
+      // Generate lead-specific variations
       final leadVariations = {
         'I': ecgSignal * 0.8,
         'II': ecgSignal * 1.0, // Reference lead
@@ -1114,21 +1245,19 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
         'aVR': -ecgSignal * 0.5, // Inverted
         'aVL': ecgSignal * 0.4,
         'aVF': ecgSignal * 0.7,
-        'V1':
-            ecgSignal * 0.6 +
-            0.1 * sin(2 * pi * 5 * t), // Slight high-frequency content
-        'V2': ecgSignal * 0.9,
-        'V3': ecgSignal * 1.2, // Higher amplitude in precordial leads
-        'V4': ecgSignal * 1.4,
-        'V5': ecgSignal * 1.1,
-        'V6': ecgSignal * 0.95,
+        'V1': ecgSignal * 0.6,
+        'V2': ecgSignal * 0.8,
+        'V3': ecgSignal * 1.1, // Higher amplitude in precordial leads
+        'V4': ecgSignal * 1.3,
+        'V5': ecgSignal * 1.0,
+        'V6': ecgSignal * 0.9,
       };
 
       // Update buffers with mock data
       for (var entry in leadVariations.entries) {
         final queue = waveController.leadBuffers[entry.key]!;
         queue.add(entry.value);
-        while (queue.length > samplesWindow) {
+        if (queue.length > samplesWindow) {
           queue.removeFirst();
         }
       }
@@ -1139,7 +1268,7 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
 
     setState(() {
       useMock = true;
-      statusMessage = 'Mock ECG data active (${hrBpm} BPM)';
+      statusMessage = 'Mock ECG data active';
     });
   }
 
@@ -1154,345 +1283,135 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
   }
 
   Widget _buildDeviceSection() {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 2),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Colors.white, Colors.grey.shade50],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 2,
-            blurRadius: 8,
-            offset: const Offset(0, 3),
-          ),
-        ],
-        border: Border.all(color: Colors.grey.shade200, width: 1),
-      ),
+    return Card(
+      elevation: 2,
       child: Padding(
-        padding: const EdgeInsets.all(0),
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Header with device connection status
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFF2c3385).withOpacity(0.05),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: const Color(0xFF2c3385).withOpacity(0.1),
-                  width: 1,
+            Row(
+              children: [
+                Icon(
+                  connectedDevice != null
+                      ? Icons.bluetooth_connected
+                      : Icons.bluetooth_searching,
+                  color: connectedDevice != null ? Colors.green : Colors.orange,
+                  size: 24,
                 ),
-              ),
-              child: Column(
-                children: [
-                  Row(
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Connection status icon
-                      Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: connectedDevice != null
-                              ? Colors.green.withOpacity(0.1)
-                              : Colors.orange.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Icon(
-                          connectedDevice != null
-                              ? Icons.bluetooth_connected_rounded
-                              : Icons.bluetooth_searching_rounded,
-                          color: connectedDevice != null
-                              ? Colors.green.shade600
-                              : Colors.orange.shade600,
-                          size: 24,
+                      Text(
+                        connectedDevice != null
+                            ? 'Connected: ${connectedDevice!.name ?? connectedDevice!.address}'
+                            : 'Searching for ECGREC-232401-177...',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
                         ),
                       ),
-                      const SizedBox(width: 16),
-
-                      // Device info
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              connectedDevice != null
-                                  ? 'Connected Device'
-                                  : 'Searching for Device',
-                              style: GoogleFonts.montserrat(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.grey[600],
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              connectedDevice != null
-                                  ? '${connectedDevice!.name ?? connectedDevice!.address}'
-                                  : 'ECGREC-232401-177...',
-                              style: GoogleFonts.montserrat(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
-                                color: const Color(0xFF2c3385),
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: isAcquiring
-                                    ? Colors.green.withOpacity(0.1)
-                                    : Colors.grey.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: Text(
-                                statusMessage,
-                                style: GoogleFonts.montserrat(
-                                  color: isAcquiring
-                                      ? Colors.green.shade700
-                                      : Colors.grey.shade600,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-
-                      // Device selection button
-                      Container(
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(8),
-                          boxShadow: [
-                            BoxShadow(
-                              color: const Color(0xFF2c3385).withOpacity(0.2),
-                              spreadRadius: 0,
-                              blurRadius: 4,
-                              offset: const Offset(0, 2),
-                            ),
-                          ],
-                        ),
-                        child: ElevatedButton(
-                          onPressed: _showDeviceDialog,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF2c3385),
-                            foregroundColor: Colors.white,
-                            elevation: 0,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.devices_rounded, size: 18),
-                              const SizedBox(width: 8),
-                              Text(
-                                connectedDevice != null
-                                    ? 'Change Device'
-                                    : 'Select Device',
-                                style: GoogleFonts.montserrat(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ],
-                          ),
+                      Text(
+                        statusMessage,
+                        style: TextStyle(
+                          color: isAcquiring
+                              ? Colors.green
+                              : Colors.grey.shade600,
+                          fontSize: 14,
                         ),
                       ),
                     ],
                   ),
-                ],
-              ),
+                ),
+                ElevatedButton.icon(
+                  onPressed: _showDeviceDialog,
+                  icon: const Icon(Icons.devices),
+                  label: Text(
+                    connectedDevice != null ? 'Change Device' : 'Select Device',
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue.shade600,
+                    foregroundColor: Colors.white,
+                  ),
+                ),
+              ],
             ),
-
-            // Device stats section (show when connected)
             if (lastECGData != null) ...[
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
               Container(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
                   color: Colors.grey.shade50,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.grey.shade200),
+                  borderRadius: BorderRadius.circular(8),
                 ),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Row(
                       children: [
-                        Icon(
-                          Icons.analytics_rounded,
-                          color: const Color(0xFF2c3385),
-                          size: 18,
-                        ),
+                        Icon(Icons.battery_full, color: Colors.green, size: 16),
                         const SizedBox(width: 8),
                         Text(
-                          'Device Statistics',
-                          style: GoogleFonts.montserrat(
-                            fontSize: 14,
-                            fontWeight: FontWeight.bold,
-                            color: const Color(0xFF2c3385),
-                          ),
+                          lastECGData!.batteryStatus,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                        const SizedBox(width: 20),
+                        Text(
+                          'Sample Rate: ${waveController.actualSampleRate.toStringAsFixed(1)} Hz',
+                          style: const TextStyle(fontSize: 12),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 12),
-
-                    // Stats grid
+                    const SizedBox(height: 4),
                     Row(
                       children: [
-                        // Battery status
+                        Icon(Icons.cable, size: 16),
+                        const SizedBox(width: 8),
                         Expanded(
-                          child: Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.grey.shade300),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Icon(
-                                      Icons.battery_full_rounded,
-                                      color: Colors.green.shade600,
-                                      size: 16,
-                                    ),
-                                    const SizedBox(width: 6),
-                                    Text(
-                                      'Battery',
-                                      style: GoogleFonts.montserrat(
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.w600,
-                                        color: Colors.grey[600],
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  lastECGData!.batteryStatus,
-                                  style: GoogleFonts.montserrat(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                    color: Colors.green.shade700,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-
-                        const SizedBox(width: 12),
-
-                        // Sample rate
-                        Expanded(
-                          child: Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.grey.shade300),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Icon(
-                                      Icons.speed_rounded,
-                                      color: Colors.blue.shade600,
-                                      size: 16,
-                                    ),
-                                    const SizedBox(width: 6),
-                                    Text(
-                                      'Sample Rate',
-                                      style: GoogleFonts.montserrat(
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.w600,
-                                        color: Colors.grey[600],
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  '${waveController.actualSampleRate.toStringAsFixed(1)} Hz',
-                                  style: GoogleFonts.montserrat(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                    color: Colors.blue.shade700,
-                                  ),
-                                ),
-                              ],
-                            ),
+                          child: Text(
+                            lastECGData!.leadStatus,
+                            style: const TextStyle(fontSize: 12),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
                       ],
-                    ),
-
-                    const SizedBox(height: 12),
-
-                    // Lead status
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.grey.shade300),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.cable_rounded,
-                            color: Colors.purple.shade600,
-                            size: 16,
-                          ),
-                          const SizedBox(width: 12),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'Lead Connection Status',
-                                style: GoogleFonts.montserrat(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.grey[600],
-                                ),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                lastECGData!.leadStatus,
-                                style: GoogleFonts.montserrat(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.purple.shade700,
-                                ),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
                     ),
                   ],
                 ),
+              ),
+            ],
+            if (lastSavedFilePath != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Icon(Icons.description, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Last file: $lastSavedFilePath',
+                      style: const TextStyle(fontSize: 12),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: () async {
+                      if (lastSavedFilePath != null) {
+                        await Clipboard.setData(
+                          ClipboardData(text: lastSavedFilePath!),
+                        );
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Path copied')),
+                          );
+                        }
+                      }
+                    },
+                    icon: const Icon(Icons.copy, size: 16),
+                    label: const Text('Copy', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
               ),
             ],
           ],
@@ -1504,384 +1423,132 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
   Widget _buildControlPanel() {
     final isConnected = connectedDevice != null;
 
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 18, vertical: 4),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Colors.white, Colors.grey.shade50],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 2,
-            blurRadius: 8,
-            offset: const Offset(0, 3),
-          ),
-        ],
-        border: Border.all(color: Colors.grey.shade200, width: 1),
-      ),
+    return Card(
+      elevation: 2,
       child: Padding(
-        padding: const EdgeInsets.all(8),
+        padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            // Settings Section
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFF2c3385).withOpacity(0.05),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: const Color(0xFF2c3385).withOpacity(0.1),
-                  width: 1,
+            Row(
+              children: [
+                const Text(
+                  'Gain:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
+                const SizedBox(width: 12),
+                DropdownButton<int>(
+                  value: currentGain,
+                  items: [1, 2, 3, 4, 6, 8, 12]
+                      .map(
+                        (g) => DropdownMenuItem(value: g, child: Text('${g}x')),
+                      )
+                      .toList(),
+                  onChanged: isAcquiring
+                      ? null
+                      : (v) {
+                          if (v != null) {
+                            setState(() => currentGain = v);
+                            waveController.setGain(v);
+                          }
+                        },
+                ),
+                const SizedBox(width: 24),
+                const Text(
+                  'Calibration:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
                     children: [
-                      Icon(
-                        Icons.settings,
-                        color: const Color(0xFF2c3385),
-                        size: 20,
+                      Slider(
+                        value: calibration,
+                        min: 0.001,
+                        max: 0.01,
+                        divisions: 100,
+                        label:
+                            '${(calibration * 1000000).toStringAsFixed(1)}µV',
+                        onChanged: (v) {
+                          setState(() => calibration = v);
+                          waveController.setRawToMv(v);
+                        },
                       ),
-                      const SizedBox(width: 8),
                       Text(
-                        'ECG Settings',
-                        style: GoogleFonts.montserrat(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          color: const Color(0xFF2c3385),
-                        ),
+                        '${(calibration * 1000000).toStringAsFixed(1)}µV/count',
                       ),
                     ],
                   ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      // Gain Section
-                      Expanded(
-                        flex: 2,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Gain Amplification',
-                              style: GoogleFonts.montserrat(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.grey[700],
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: Colors.grey.shade300),
-                              ),
-                              child: DropdownButtonHideUnderline(
-                                child: DropdownButton<int>(
-                                  value: currentGain,
-                                  isExpanded: true,
-                                  icon: Icon(
-                                    Icons.keyboard_arrow_down,
-                                    color: const Color(0xFF2c3385),
-                                  ),
-                                  style: GoogleFonts.montserrat(
-                                    color: const Color(0xFF2c3385),
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  items: [1, 2, 3, 4, 6, 8, 12]
-                                      .map(
-                                        (g) => DropdownMenuItem(
-                                          value: g,
-                                          child: Text('${g}x Gain'),
-                                        ),
-                                      )
-                                      .toList(),
-                                  onChanged: isAcquiring
-                                      ? null
-                                      : (v) {
-                                          if (v != null) {
-                                            setState(() => currentGain = v);
-                                            waveController.setGain(v);
-                                          }
-                                        },
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 20),
-                      // Calibration Section
-                      Expanded(
-                        flex: 3,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Signal Calibration',
-                              style: GoogleFonts.montserrat(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.grey[700],
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 8,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: Colors.grey.shade300),
-                              ),
-                              child: Column(
-                                children: [
-                                  SliderTheme(
-                                    data: SliderTheme.of(context).copyWith(
-                                      activeTrackColor: const Color(0xFF2c3385),
-                                      inactiveTrackColor: Colors.grey.shade300,
-                                      thumbColor: const Color(0xFF2c3385),
-                                      overlayColor: const Color(
-                                        0xFF2c3385,
-                                      ).withOpacity(0.2),
-                                      trackHeight: 4,
-                                      thumbShape: const RoundSliderThumbShape(
-                                        enabledThumbRadius: 8,
-                                      ),
-                                    ),
-                                    child: Slider(
-                                      value: calibration,
-                                      min: 0.001,
-                                      max: 0.01,
-                                      divisions: 100,
-                                      onChanged: (v) {
-                                        setState(() => calibration = v);
-                                        waveController.setRawToMv(v);
-                                      },
-                                    ),
-                                  ),
-                                  Text(
-                                    '${(calibration * 1000000).toStringAsFixed(1)}µV/count',
-                                    style: GoogleFonts.montserrat(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w500,
-                                      color: const Color(0xFF2c3385),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
-
-            const SizedBox(height: 20),
-
-            // Control Buttons Section
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade50,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.grey.shade200),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        Icons.control_camera,
-                        color: const Color(0xFF2c3385),
-                        size: 20,
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Recording Controls',
-                        style: GoogleFonts.montserrat(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          color: const Color(0xFF2c3385),
-                        ),
-                      ),
-                    ],
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: isConnected && !isAcquiring
+                      ? _startAcquisition
+                      : null,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Start ECG'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
                   ),
-                  const SizedBox(height: 12),
-                  // Action Buttons Row
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _buildActionButton(
-                          onPressed: isConnected && !isAcquiring
-                              ? _startAcquisition
-                              : null,
-                          icon: Icons.play_arrow_rounded,
-                          label: 'Start ECG',
-                          color: Colors.green.shade600,
-                          isEnabled: isConnected && !isAcquiring,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _buildActionButton(
-                          onPressed: isAcquiring ? _stopAcquisition : null,
-                          icon: Icons.stop_rounded,
-                          label: 'Stop',
-                          color: Colors.red.shade600,
-                          isEnabled: isAcquiring,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _buildActionButton(
-                          onPressed: isConnected ? _disconnect : null,
-                          icon: Icons.bluetooth_disabled_rounded,
-                          label: 'Disconnect',
-                          color: Colors.orange.shade600,
-                          isEnabled: isConnected,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _buildActionButton(
-                          onPressed: waveController.clear,
-                          icon: Icons.clear_all_rounded,
-                          label: 'Clear',
-                          color: Colors.grey.shade600,
-                          isEnabled: true,
-                        ),
-                      ),
-                    ],
+                ),
+                ElevatedButton.icon(
+                  onPressed: isAcquiring ? _stopAcquisition : null,
+                  icon: const Icon(Icons.stop),
+                  label: const Text('Stop'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                ),
+                ElevatedButton.icon(
+                  onPressed: isRecording
+                      ? () => _stopRecording()
+                      : _startRecording,
+                  icon: Icon(
+                    isRecording ? Icons.save_alt : Icons.fiber_manual_record,
                   ),
-
-                  const SizedBox(height: 12),
-
-                  // Mock Data Toggle
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.grey.shade300),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.science_rounded,
-                          color: useMock
-                              ? const Color(0xFF2c3385)
-                              : Colors.grey.shade500,
-                          size: 20,
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'Mock Data Generator',
-                                style: GoogleFonts.montserrat(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w600,
-                                  color: useMock
-                                      ? const Color(0xFF2c3385)
-                                      : Colors.grey.shade700,
-                                ),
-                              ),
-                              Text(
-                                'Generate simulated ECG signals for testing',
-                                style: GoogleFonts.montserrat(
-                                  fontSize: 11,
-                                  color: Colors.grey.shade600,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        Transform.scale(
-                          scale: 0.9,
-                          child: Switch(
-                            value: useMock,
-                            activeColor: const Color(0xFF2c3385),
-                            onChanged: (v) {
-                              if (v) {
-                                _startMockData();
-                              } else {
-                                _mockTimer?.cancel();
-                                setState(() {
-                                  useMock = false;
-                                  statusMessage = 'Mock data stopped';
-                                });
-                              }
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
+                  label: Text(isRecording ? 'Stop Recording' : 'Record JSON'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: isRecording
+                        ? Colors.orange
+                        : Colors.blueGrey,
+                    foregroundColor: Colors.white,
                   ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildActionButton({
-    required VoidCallback? onPressed,
-    required IconData icon,
-    required String label,
-    required Color color,
-    required bool isEnabled,
-  }) {
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 200),
-      child: ElevatedButton(
-        onPressed: onPressed,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: isEnabled ? color : Colors.grey.shade300,
-          foregroundColor: Colors.white,
-          disabledBackgroundColor: Colors.grey.shade300,
-          disabledForegroundColor: Colors.grey.shade500,
-          elevation: isEnabled ? 2 : 0,
-          shadowColor: color.withOpacity(0.3),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 20),
-            const SizedBox(height: 4),
-            Text(
-              label,
-              style: GoogleFonts.montserrat(
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-              ),
-              textAlign: TextAlign.center,
+                ),
+                ElevatedButton.icon(
+                  onPressed: isConnected ? _disconnect : null,
+                  icon: const Icon(Icons.bluetooth_disabled),
+                  label: const Text('Disconnect'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.orange,
+                  ),
+                ),
+                ElevatedButton.icon(
+                  onPressed: waveController.clear,
+                  icon: const Icon(Icons.clear),
+                  label: const Text('Clear'),
+                ),
+                Column(
+                  children: [
+                    Switch(
+                      value: useMock,
+                      onChanged: (v) {
+                        if (v) {
+                          _startMockData();
+                        } else {
+                          _mockTimer?.cancel();
+                          setState(() {
+                            useMock = false;
+                            statusMessage = 'Mock data stopped';
+                          });
+                        }
+                      },
+                    ),
+                    const Text('Mock Data', style: TextStyle(fontSize: 12)),
+                  ],
+                ),
+              ],
             ),
           ],
         ),
@@ -1916,81 +1583,26 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
       valueListenable: waveController.tick,
       builder: (context, _, __) {
         return SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 4),
+          padding: const EdgeInsets.all(8),
           child: Column(
             children: [
               // Summary info
-              Container(
-                margin: const EdgeInsets.only(bottom: 16),
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.grey.withOpacity(0.1),
-                      spreadRadius: 1,
-                      blurRadius: 4,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
-                  border: Border.all(color: Colors.grey.shade200),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.favorite,
-                          color: Colors.red.shade600,
-                          size: 16,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          'Heart Rate: ${_calculateHeartRate()}',
-                          style: GoogleFonts.montserrat(
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.analytics,
-                          color: Colors.blue.shade600,
-                          size: 16,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          'Samples: ${waveController.totalSamplesProcessed}',
-                          style: GoogleFonts.montserrat(
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.check_circle,
-                          color: Colors.green.shade600,
-                          size: 16,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          'Success Rate: ${(parser.packetSuccessRate * 100).toStringAsFixed(1)}%',
-                          style: GoogleFonts.montserrat(
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      Text('Heart Rate: ${_calculateHeartRate()}'),
+                      Text('Samples: ${waveController.totalSamplesProcessed}'),
+                      Text(
+                        'Success Rate: ${(parser.packetSuccessRate * 100).toStringAsFixed(1)}%',
+                      ),
+                    ],
+                  ),
                 ),
               ),
-
+              const SizedBox(height: 8),
               // Lead groups
               ...leadGroups.asMap().entries.map((groupEntry) {
                 final groupIndex = groupEntry.key;
@@ -1998,20 +1610,14 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
 
                 return Column(
                   children: [
-                    if (groupIndex > 0) const SizedBox(height: 8),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.symmetric(
-                        vertical: 12,
-                        horizontal: 16,
-                      ),
-
+                    if (groupIndex > 0) const SizedBox(height: 12),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
                       child: Text(
                         _getGroupName(groupIndex),
-                        style: GoogleFonts.montserrat(
+                        style: const TextStyle(
                           fontWeight: FontWeight.bold,
                           fontSize: 16,
-                          color: const Color(0xFF2c3385),
                         ),
                       ),
                     ),
@@ -2021,21 +1627,13 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
                       final colorIndex = groupIndex * 3 + leadIndex;
                       final samples = waveController.getSamples(lead);
 
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 8),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.grey.shade200),
-                        ),
-                        child: ECGChart(
-                          leadName: lead,
-                          samples: samples,
-                          color: colors[colorIndex % colors.length],
-                          height: 100,
-                          showCalibration: groupIndex == 0 && leadIndex == 0,
-                          pmm: pixelsPerMmDefault,
-                        ),
+                      return ECGChart(
+                        leadName: lead,
+                        samples: samples,
+                        color: colors[colorIndex % colors.length],
+                        height: 100,
+                        showCalibration: groupIndex == 0 && leadIndex == 0,
+                        pmm: pixelsPerMmDefault,
                       );
                     }),
                   ],
@@ -2066,247 +1664,84 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
 
     return Column(
       children: [
-        Container(
-          margin: const EdgeInsets.symmetric(horizontal: 18, vertical: 4),
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(12),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.grey.withOpacity(0.1),
-                spreadRadius: 1,
-                blurRadius: 4,
-                offset: const Offset(0, 2),
-              ),
-            ],
-            border: Border.all(color: Colors.grey.shade200),
-          ),
-          child: Column(
-            children: [
-              // Lead selection and stats row
-              Row(
-                children: [
-                  Icon(
-                    Icons.show_chart,
-                    color: const Color(0xFF2c3385),
-                    size: 18,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    'Lead:',
-                    style: GoogleFonts.montserrat(
-                      fontWeight: FontWeight.bold,
-                      color: const Color(0xFF2c3385),
+        Card(
+          margin: const EdgeInsets.all(8),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const Text(
+                      'Lead:',
+                      style: TextStyle(fontWeight: FontWeight.bold),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 4,
+                    const SizedBox(width: 12),
+                    DropdownButton<String>(
+                      value: selectedLead,
+                      items: allLeads
+                          .map(
+                            (l) => DropdownMenuItem(value: l, child: Text(l)),
+                          )
+                          .toList(),
+                      onChanged: (v) => setState(() {
+                        if (v != null) selectedLead = v;
+                      }),
                     ),
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade50,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: Colors.grey.shade300),
-                    ),
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<String>(
-                        value: selectedLead,
-                        style: GoogleFonts.montserrat(
-                          color: const Color(0xFF2c3385),
-                          fontWeight: FontWeight.w600,
-                        ),
-                        items: allLeads
-                            .map(
-                              (l) => DropdownMenuItem(
-                                value: l,
-                                child: Text('Lead $l'),
-                              ),
-                            )
-                            .toList(),
-                        onChanged: (v) => setState(() {
-                          if (v != null) selectedLead = v;
-                        }),
-                      ),
-                    ),
-                  ),
-                  const Spacer(),
-                  ValueListenableBuilder(
-                    valueListenable: waveController.tick,
-                    builder: (context, _, __) {
-                      final samples = waveController.getSamples(selectedLead);
-                      return Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: Colors.blue.withOpacity(0.05),
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
-                            color: Colors.blue.withOpacity(0.2),
-                          ),
-                        ),
-                        child: Column(
+                    const Spacer(),
+                    ValueListenableBuilder(
+                      valueListenable: waveController.tick,
+                      builder: (context, _, __) {
+                        final samples = waveController.getSamples(selectedLead);
+                        return Column(
                           crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  Icons.analytics,
-                                  color: Colors.blue.shade600,
-                                  size: 14,
-                                ),
-                                const SizedBox(width: 4),
-                                Text(
-                                  'Samples: ${samples.length}',
-                                  style: GoogleFonts.montserrat(
-                                    fontWeight: FontWeight.w600,
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            if (samples.isNotEmpty) ...[
-                              const SizedBox(height: 2),
+                            Text('Samples: ${samples.length}'),
+                            if (samples.isNotEmpty)
                               Text(
                                 'Range: ${samples.reduce(min).toStringAsFixed(2)} to ${samples.reduce(max).toStringAsFixed(2)} mV',
-                                style: GoogleFonts.montserrat(
-                                  fontSize: 10,
-                                  color: Colors.grey[600],
-                                ),
                               ),
-                            ],
                           ],
-                        ),
-                      );
-                    },
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-
-              // Technical parameters row
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade50,
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: Colors.grey.shade200),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.tune,
-                          color: const Color(0xFF2c3385),
-                          size: 14,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'Gain: ${currentGain}x',
-                          style: GoogleFonts.montserrat(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.straighten,
-                          color: const Color(0xFF2c3385),
-                          size: 14,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'Calibration: ${(calibration * 1000000).toStringAsFixed(1)}µV/count',
-                          style: GoogleFonts.montserrat(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.speed,
-                          color: const Color(0xFF2c3385),
-                          size: 14,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'Paper Speed: ${mmPerSecond}mm/s',
-                          style: GoogleFonts.montserrat(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.aspect_ratio,
-                          color: const Color(0xFF2c3385),
-                          size: 14,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'Scale: ${pixelsPerMmDefault}px/mm',
-                          style: GoogleFonts.montserrat(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
+                        );
+                      },
                     ),
                   ],
                 ),
-              ),
-            ],
-          ),
-        ),
-
-        Expanded(
-          child: Container(
-            margin: const EdgeInsets.symmetric(horizontal: 16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(12),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.grey.withOpacity(0.1),
-                  spreadRadius: 1,
-                  blurRadius: 4,
-                  offset: const Offset(0, 2),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Text('Gain: ${currentGain}x'),
+                    const SizedBox(width: 20),
+                    Text(
+                      'Calibration: ${(calibration * 1000000).toStringAsFixed(1)}µV/count',
+                    ),
+                    const SizedBox(width: 20),
+                    Text('Paper Speed: ${mmPerSecond}mm/s'),
+                  ],
                 ),
               ],
-              border: Border.all(color: Colors.grey.shade200),
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: ValueListenableBuilder(
-                valueListenable: waveController.tick,
-                builder: (context, _, __) {
-                  final samples = waveController.getSamples(selectedLead);
-                  return ECGChart(
-                    leadName: selectedLead,
-                    samples: samples,
-                    color: Colors.red.shade700,
-                    height: double.infinity,
-                    showCalibration: true,
-                    pmm: pixelsPerMmDefault,
-                  );
-                },
-              ),
             ),
           ),
         ),
-        const SizedBox(height: 16),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: ValueListenableBuilder(
+              valueListenable: waveController.tick,
+              builder: (context, _, __) {
+                final samples = waveController.getSamples(selectedLead);
+                return ECGChart(
+                  leadName: selectedLead,
+                  samples: samples,
+                  color: Colors.red.shade700,
+                  height: double.infinity,
+                  showCalibration: true,
+                  pmm: pixelsPerMmDefault,
+                );
+              },
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -2320,397 +1755,181 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Real-time Statistics Section
-              Container(
-                margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [Colors.white, Colors.grey.shade50],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(16),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.grey.withOpacity(0.1),
-                      spreadRadius: 2,
-                      blurRadius: 8,
-                      offset: const Offset(0, 3),
-                    ),
-                  ],
-                  border: Border.all(color: Colors.grey.shade200, width: 1),
-                ),
+              // Real-time statistics
+              Card(
                 child: Padding(
-                  padding: const EdgeInsets.all(8),
+                  padding: const EdgeInsets.all(16),
                   child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Statistics Section
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF2c3385).withOpacity(0.05),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                            color: const Color(0xFF2c3385).withOpacity(0.1),
-                            width: 1,
-                          ),
+                      const Text(
+                        'Real-time Statistics',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  Icons.analytics_rounded,
-                                  color: const Color(0xFF2c3385),
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Real-time Statistics',
-                                  style: GoogleFonts.montserrat(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.bold,
-                                    color: const Color(0xFF2c3385),
-                                  ),
-                                ),
-                              ],
+                      ),
+                      const SizedBox(height: 12),
+                      if (lastECGData != null) ...[
+                        _buildStatRow('Heart Rate', _calculateHeartRate()),
+                        _buildStatRow(
+                          'Sample Rate',
+                          '${waveController.actualSampleRate.toStringAsFixed(1)} Hz',
+                        ),
+                        _buildStatRow(
+                          'Total Samples',
+                          waveController.totalSamplesProcessed.toString(),
+                        ),
+                        _buildStatRow(
+                          'Packet Success Rate',
+                          '${(parser.packetSuccessRate * 100).toStringAsFixed(1)}%',
+                        ),
+                        _buildStatRow('Lead Status', lastECGData!.leadStatus),
+                        _buildStatRow('Battery', lastECGData!.batteryStatus),
+                        _buildStatRow(
+                          'Last Update',
+                          lastECGData!.timestamp.toString().substring(11, 19),
+                        ),
+                      ] else
+                        const Text('No ECG data received yet'),
+                    ],
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // Lead sample counts
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Lead Sample Counts',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: waveController.leadBuffers.entries.map((
+                          entry,
+                        ) {
+                          final leadName = entry.key;
+                          final sampleCount = entry.value.length;
+                          final samples = List<double>.from(entry.value);
+                          final hasData = samples.isNotEmpty;
+
+                          return Chip(
+                            avatar: CircleAvatar(
+                              backgroundColor: sampleCount > 100
+                                  ? Colors.green
+                                  : Colors.orange,
+                              child: Text(
+                                '${leadName[0]}',
+                                style: const TextStyle(fontSize: 10),
+                              ),
                             ),
-                            const SizedBox(height: 12),
-                            if (lastECGData != null) ...[
-                              _buildStatRow(
-                                'Heart Rate',
-                                _calculateHeartRate(),
-                              ),
-                              _buildStatRow(
-                                'Sample Rate',
-                                '${waveController.actualSampleRate.toStringAsFixed(1)} Hz',
-                              ),
-                              _buildStatRow(
-                                'Total Samples',
-                                waveController.totalSamplesProcessed.toString(),
-                              ),
-                              _buildStatRow(
-                                'Packet Success Rate',
-                                '${(parser.packetSuccessRate * 100).toStringAsFixed(1)}%',
-                              ),
-                              _buildStatRow(
-                                'Lead Status',
-                                lastECGData!.leadStatus,
-                              ),
-                              _buildStatRow(
-                                'Battery',
-                                lastECGData!.batteryStatus,
-                              ),
-                              _buildStatRow(
-                                'Last Update',
-                                lastECGData!.timestamp.toString().substring(
-                                  11,
-                                  19,
-                                ),
-                              ),
-                              _buildStatRow(
-                                'Display Settings',
-                                'Scale: ${pixelsPerMmDefault}px/mm, Speed: ${mmPerSecond}mm/s',
-                              ),
-                            ] else
-                              Container(
-                                padding: const EdgeInsets.all(12),
-                                decoration: BoxDecoration(
-                                  color: Colors.orange.shade50,
-                                  borderRadius: BorderRadius.circular(8),
-                                  border: Border.all(
-                                    color: Colors.orange.shade200,
-                                  ),
-                                ),
-                                child: Row(
+                            label: Text(
+                              '$leadName: $sampleCount${hasData ? " (${samples.last.toStringAsFixed(2)}mV)" : ""}',
+                            ),
+                            backgroundColor: sampleCount > 100
+                                ? Colors.green.shade50
+                                : Colors.orange.shade50,
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // Recent values visualization
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Text(
+                            'Recent Lead II Values (mV)',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const Spacer(),
+                          ElevatedButton.icon(
+                            onPressed: waveController.clear,
+                            icon: const Icon(Icons.clear_all),
+                            label: const Text('Clear All Data'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      SizedBox(
+                        height: 80,
+                        child: ListView.builder(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: min(
+                            30,
+                            waveController.getSamples('II').length,
+                          ),
+                          itemBuilder: (context, i) {
+                            final samples = waveController.getSamples('II');
+                            if (i >= samples.length) return const SizedBox();
+
+                            final value = samples[samples.length - 1 - i];
+                            final isPositive = value >= 0;
+
+                            return Container(
+                              width: 60,
+                              margin: const EdgeInsets.only(right: 4),
+                              child: Card(
+                                color: isPositive
+                                    ? Colors.green.shade50
+                                    : Colors.red.shade50,
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
                                     Icon(
-                                      Icons.warning_amber_rounded,
-                                      color: Colors.orange.shade600,
-                                      size: 20,
+                                      isPositive
+                                          ? Icons.arrow_upward
+                                          : Icons.arrow_downward,
+                                      size: 16,
+                                      color: isPositive
+                                          ? Colors.green
+                                          : Colors.red,
                                     ),
-                                    const SizedBox(width: 8),
                                     Text(
-                                      'No ECG data received yet',
-                                      style: GoogleFonts.montserrat(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w500,
-                                        color: Colors.orange.shade700,
+                                      value.toStringAsFixed(3),
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        fontFamily: 'monospace',
+                                      ),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                    Text(
+                                      'T-${i}',
+                                      style: TextStyle(
+                                        fontSize: 9,
+                                        color: Colors.grey.shade600,
                                       ),
                                     ),
                                   ],
                                 ),
                               ),
-                          ],
-                        ),
-                      ),
-
-                      const SizedBox(height: 20),
-
-                      // Lead Sample Counts Section
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: Colors.grey.shade50,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: Colors.grey.shade200),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  Icons.biotech_rounded,
-                                  color: const Color(0xFF2c3385),
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Lead Sample Counts & Recent Values',
-                                  style: GoogleFonts.montserrat(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.bold,
-                                    color: const Color(0xFF2c3385),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 12),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: waveController.leadBuffers.entries.map((
-                                entry,
-                              ) {
-                                final leadName = entry.key;
-                                final sampleCount = entry.value.length;
-                                final samples = List<double>.from(entry.value);
-                                final hasData = samples.isNotEmpty;
-                                final isHealthy = sampleCount > 100;
-
-                                return Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 12,
-                                    vertical: 8,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white,
-                                    borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(
-                                      color: isHealthy
-                                          ? Colors.green.shade300
-                                          : Colors.orange.shade300,
-                                    ),
-                                  ),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Container(
-                                        width: 24,
-                                        height: 24,
-                                        decoration: BoxDecoration(
-                                          color: isHealthy
-                                              ? Colors.green.shade100
-                                              : Colors.orange.shade100,
-                                          shape: BoxShape.circle,
-                                        ),
-                                        child: Center(
-                                          child: Text(
-                                            leadName.length > 2
-                                                ? leadName.substring(0, 2)
-                                                : leadName,
-                                            style: GoogleFonts.montserrat(
-                                              fontSize: 9,
-                                              fontWeight: FontWeight.bold,
-                                              color: isHealthy
-                                                  ? Colors.green.shade700
-                                                  : Colors.orange.shade700,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Text(
-                                        '$leadName: $sampleCount${hasData ? " (${samples.last.toStringAsFixed(2)}mV)" : ""}',
-                                        style: GoogleFonts.montserrat(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w500,
-                                          color: Colors.grey.shade700,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                );
-                              }).toList(),
-                            ),
-                          ],
-                        ),
-                      ),
-
-                      const SizedBox(height: 20),
-
-                      // Signal Quality Assessment Section
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF2c3385).withOpacity(0.05),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                            color: const Color(0xFF2c3385).withOpacity(0.1),
-                            width: 1,
-                          ),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  Icons.signal_cellular_alt_rounded,
-                                  color: const Color(0xFF2c3385),
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Signal Quality Assessment',
-                                  style: GoogleFonts.montserrat(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.bold,
-                                    color: const Color(0xFF2c3385),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 12),
-                            _buildSignalQualityIndicators(),
-                          ],
-                        ),
-                      ),
-
-                      const SizedBox(height: 20),
-
-                      // Recent Values Section
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: Colors.grey.shade50,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: Colors.grey.shade200),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  Icons.timeline_rounded,
-                                  color: const Color(0xFF2c3385),
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Recent Lead II Values (mV)',
-                                  style: GoogleFonts.montserrat(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.bold,
-                                    color: const Color(0xFF2c3385),
-                                  ),
-                                ),
-                                const Spacer(),
-                                _buildActionButton(
-                                  onPressed: waveController.clear,
-                                  icon: Icons.clear_all_rounded,
-                                  label: 'Clear',
-                                  color: Colors.grey.shade600,
-                                  isEnabled: true,
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 12),
-                            Container(
-                              height: 100,
-                              padding: const EdgeInsets.all(8),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: Colors.grey.shade300),
-                              ),
-                              child: ListView.builder(
-                                scrollDirection: Axis.horizontal,
-                                itemCount: min(
-                                  30,
-                                  waveController.getSamples('II').length,
-                                ),
-                                itemBuilder: (context, i) {
-                                  final samples = waveController.getSamples(
-                                    'II',
-                                  );
-                                  if (i >= samples.length)
-                                    return const SizedBox();
-
-                                  final value = samples[samples.length - 1 - i];
-                                  final isPositive = value >= 0;
-
-                                  return Container(
-                                    width: 60,
-                                    margin: const EdgeInsets.only(right: 4),
-                                    child: Container(
-                                      decoration: BoxDecoration(
-                                        color: isPositive
-                                            ? Colors.green.shade50
-                                            : Colors.red.shade50,
-                                        borderRadius: BorderRadius.circular(8),
-                                        border: Border.all(
-                                          color: isPositive
-                                              ? Colors.green.shade200
-                                              : Colors.red.shade200,
-                                        ),
-                                      ),
-                                      child: Column(
-                                        mainAxisAlignment:
-                                            MainAxisAlignment.center,
-                                        children: [
-                                          Icon(
-                                            isPositive
-                                                ? Icons.arrow_upward_rounded
-                                                : Icons.arrow_downward_rounded,
-                                            size: 16,
-                                            color: isPositive
-                                                ? Colors.green.shade600
-                                                : Colors.red.shade600,
-                                          ),
-                                          const SizedBox(height: 2),
-                                          Text(
-                                            value.toStringAsFixed(3),
-                                            style: TextStyle(
-                                              fontFamily: 'monospace',
-                                              fontSize: 11,
-                                              fontWeight: FontWeight.w600,
-                                              color: isPositive
-                                                  ? Colors.green.shade700
-                                                  : Colors.red.shade700,
-                                            ),
-                                            textAlign: TextAlign.center,
-                                          ),
-                                          const SizedBox(height: 2),
-                                          Text(
-                                            'T-${i}',
-                                            style: GoogleFonts.montserrat(
-                                              fontSize: 9,
-                                              fontWeight: FontWeight.w500,
-                                              color: Colors.grey.shade600,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                          ],
+                            );
+                          },
                         ),
                       ),
                     ],
@@ -2725,165 +1944,43 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
   }
 
   Widget _buildStatRow(String label, String value) {
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-      margin: const EdgeInsets.only(bottom: 4),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.7),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.grey.shade200),
-      ),
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         children: [
           SizedBox(
             width: 140,
             child: Text(
               '$label:',
-              style: GoogleFonts.montserrat(
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-                color: Colors.grey[700],
-              ),
+              style: const TextStyle(fontWeight: FontWeight.w500),
             ),
           ),
           Expanded(
             child: Text(
               value,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 14,
-                fontWeight: FontWeight.w500,
-                color: Color(0xFF2c3385),
-              ),
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
             ),
           ),
         ],
       ),
     );
-  }
-
-  Widget _buildSignalQualityIndicators() {
-    final leadIISamples = waveController.getSamples('II');
-    if (leadIISamples.isEmpty) {
-      return const Text('No signal data available');
-    }
-
-    // Calculate signal quality metrics
-    final amplitude = _calculateSignalAmplitude(leadIISamples);
-    final noiseLevel = _calculateNoiseLevel(leadIISamples);
-    final signalToNoise = amplitude > 0
-        ? amplitude / max(noiseLevel, 0.001)
-        : 0;
-    final baselineDrift = _calculateBaselineDrift(leadIISamples);
-
-    return Column(
-      children: [
-        _buildQualityIndicator(
-          'Signal Amplitude',
-          '${amplitude.toStringAsFixed(3)} mV',
-          amplitude > 0.1 ? Colors.green : Colors.orange,
-        ),
-        _buildQualityIndicator(
-          'Noise Level',
-          '${noiseLevel.toStringAsFixed(3)} mV',
-          noiseLevel < 0.05 ? Colors.green : Colors.red,
-        ),
-        _buildQualityIndicator(
-          'Signal-to-Noise',
-          '${signalToNoise.toStringAsFixed(1)}',
-          signalToNoise > 10 ? Colors.green : Colors.orange,
-        ),
-        _buildQualityIndicator(
-          'Baseline Drift',
-          '${baselineDrift.toStringAsFixed(3)} mV',
-          baselineDrift < 0.1 ? Colors.green : Colors.orange,
-        ),
-      ],
-    );
-  }
-
-  Widget _buildQualityIndicator(String label, String value, Color color) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        children: [
-          Container(
-            width: 12,
-            height: 12,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 120,
-            child: Text(
-              '$label:',
-              style: const TextStyle(fontWeight: FontWeight.w500),
-            ),
-          ),
-          Text(
-            value,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
-          ),
-        ],
-      ),
-    );
-  }
-
-  double _calculateSignalAmplitude(List<double> samples) {
-    if (samples.isEmpty) return 0.0;
-    return samples.reduce(max) - samples.reduce(min);
-  }
-
-  double _calculateNoiseLevel(List<double> samples) {
-    if (samples.length < 3) return 0.0;
-
-    // Calculate high-frequency noise by examining sample-to-sample variations
-    double totalVariation = 0.0;
-    for (int i = 1; i < samples.length; i++) {
-      totalVariation += (samples[i] - samples[i - 1]).abs();
-    }
-    return totalVariation / (samples.length - 1);
-  }
-
-  double _calculateBaselineDrift(List<double> samples) {
-    if (samples.length < 100) return 0.0;
-
-    // Calculate baseline drift by comparing means of first and last quarters
-    final quarterSize = samples.length ~/ 4;
-    final firstQuarter = samples.take(quarterSize).toList();
-    final lastQuarter = samples.skip(samples.length - quarterSize).toList();
-
-    final firstMean =
-        firstQuarter.reduce((a, b) => a + b) / firstQuarter.length;
-    final lastMean = lastQuarter.reduce((a, b) => a + b) / lastQuarter.length;
-
-    return (lastMean - firstMean).abs();
   }
 
   String _calculateHeartRate() {
     final samples = waveController.getSamples('II');
     if (samples.length < samplingRate) return 'Calculating...';
 
-    // IMPROVED R-wave detection with adaptive thresholding
+    // Enhanced R-wave detection
     int peakCount = 0;
     double adaptiveThreshold = 0.3;
     bool wasAboveThreshold = false;
     int samplesAboveThreshold = 0;
-    int lastPeakIndex = -1000; // Prevent double counting
-    final minPeakDistance = (samplingRate * 0.3)
-        .round(); // 300ms minimum between peaks
 
-    // Calculate adaptive threshold based on signal statistics
+    // Calculate adaptive threshold based on signal amplitude
     if (samples.isNotEmpty) {
       final maxVal = samples.reduce(max);
       final minVal = samples.reduce(min);
-      final range = maxVal - minVal;
-
-      if (range > 0.1) {
-        // Only if we have significant signal
-        adaptiveThreshold =
-            minVal + (range * 0.6); // 60% of range above minimum
-      }
+      adaptiveThreshold = (maxVal - minVal) * 0.4 + minVal;
     }
 
     for (int i = 1; i < samples.length; i++) {
@@ -2892,15 +1989,15 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
 
       if (current > adaptiveThreshold) {
         samplesAboveThreshold++;
-        if (!wasAboveThreshold &&
-            previous <= adaptiveThreshold &&
-            (i - lastPeakIndex) > minPeakDistance) {
-          // Rising edge detected with minimum distance constraint
+        if (!wasAboveThreshold && previous <= adaptiveThreshold) {
+          // Rising edge detected
           peakCount++;
-          lastPeakIndex = i;
         }
         wasAboveThreshold = true;
       } else {
+        if (wasAboveThreshold && samplesAboveThreshold > 5) {
+          // Valid peak completed (minimum width check)
+        }
         samplesAboveThreshold = 0;
         wasAboveThreshold = false;
       }
@@ -2909,7 +2006,7 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
     if (peakCount < 2) return 'Detecting...';
 
     final timeSpan = samples.length / samplingRate;
-    final bpm = ((peakCount - 1) / timeSpan * 60).round().clamp(30, 250);
+    final bpm = ((peakCount - 1) / timeSpan * 60).round().clamp(30, 200);
 
     return '$bpm BPM';
   }
@@ -3160,33 +2257,75 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
     );
   }
 
-  // Add this header method to your ECG monitor class
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'ECG Monitor',
-      theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
+      title: 'Professional ECG Monitor',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        useMaterial3: true,
+        appBarTheme: const AppBarTheme(elevation: 2, centerTitle: true),
+      ),
       home: Scaffold(
-        backgroundColor: Colors.white,
-        body: SafeArea(
-          child: Column(
+        appBar: AppBar(
+          title: const Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              _buildHeader(),
-              _buildDeviceSection(),
-              _buildControlPanel(),
-              Expanded(
-                child: TabBarView(
-                  controller: tabController,
-                  children: [
-                    _buildStandardTwelveLeadView(),
-                    _buildSingleLeadView(),
-                    _buildDataAnalysis(),
-                  ],
-                ),
-              ),
+              Icon(Icons.monitor_heart, color: Colors.red),
+              SizedBox(width: 8),
+              Text('Professional ECG Monitor'),
             ],
           ),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.devices),
+              onPressed: _showDeviceDialog,
+              tooltip: 'Device Selection',
+            ),
+            IconButton(
+              icon: const Icon(Icons.bluetooth_searching),
+              onPressed: btService.startScan,
+              tooltip: 'Start Bluetooth Scan',
+            ),
+            Container(
+              margin: const EdgeInsets.only(right: 8),
+              child: IconButton(
+                icon: Icon(
+                  isAcquiring ? Icons.pause_circle : Icons.play_circle,
+                ),
+                onPressed: connectedDevice != null
+                    ? (isAcquiring ? _stopAcquisition : _startAcquisition)
+                    : null,
+                tooltip: isAcquiring ? 'Stop ECG' : 'Start ECG',
+                iconSize: 32,
+              ),
+            ),
+          ],
+          bottom: TabBar(
+            controller: tabController,
+            tabs: const [
+              Tab(icon: Icon(Icons.grid_view), text: '12-Lead ECG'),
+              Tab(icon: Icon(Icons.show_chart), text: 'Single Lead'),
+              Tab(icon: Icon(Icons.analytics), text: 'Analysis'),
+            ],
+          ),
+        ),
+        body: Column(
+          children: [
+            _buildDeviceSection(),
+            _buildControlPanel(),
+            Expanded(
+              child: TabBarView(
+                controller: tabController,
+                children: [
+                  _buildStandardTwelveLeadView(),
+                  _buildSingleLeadView(),
+                  _buildDataAnalysis(),
+                ],
+              ),
+            ),
+          ],
         ),
         floatingActionButton: Column(
           mainAxisAlignment: MainAxisAlignment.end,
@@ -3196,7 +2335,7 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
                 heroTag: 'connect',
                 mini: true,
                 onPressed: _showDeviceDialog,
-                backgroundColor: const Color(0xFF2c3385),
+                backgroundColor: Colors.blue.shade600,
                 tooltip: 'Connect to ECG Device',
                 child: const Icon(
                   Icons.bluetooth_searching,
@@ -3220,225 +2359,6 @@ class _ECGAppState extends State<ECGApp> with SingleTickerProviderStateMixin {
               ),
             ],
           ],
-        ),
-      ),
-    );
-  }
-
-  // Add this header method to your ECG monitor class
-  Widget _buildHeader() {
-    const Color primaryBlue = Color(0xFF2c3385);
-
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: Card(
-        elevation: 4,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        clipBehavior: Clip.antiAlias,
-        child: Container(
-          decoration: BoxDecoration(
-            color: primaryBlue.withOpacity(0.9),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Column(
-            children: [
-              // Main header section
-              Container(
-                height: 90,
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Row(
-                  children: [
-                    IconButton(
-                      icon: const Icon(
-                        Icons.keyboard_backspace,
-                        size: 30,
-                        color: Colors.white,
-                      ),
-                      onPressed: () => Navigator.of(context).pop(),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'ECG Monitor',
-                            style: GoogleFonts.raleway(
-                              color: Colors.white,
-                              fontSize: 24,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            'Real-time cardiac monitoring & analysis',
-                            style: GoogleFonts.raleway(
-                              color: Colors.white70,
-                              fontSize: 16,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        IconButton(
-                          icon: const Icon(Icons.devices),
-                          onPressed: _showDeviceDialog,
-                          tooltip: 'Device Selection',
-                          color: Colors.white,
-                          iconSize: 24,
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.bluetooth_searching),
-                          onPressed: btService.startScan,
-                          tooltip: 'Start Bluetooth Scan',
-                          color: Colors.white,
-                          iconSize: 24,
-                        ),
-                        Container(
-                          margin: const EdgeInsets.only(right: 4),
-                          child: IconButton(
-                            icon: Icon(
-                              isAcquiring
-                                  ? Icons.pause_circle
-                                  : Icons.play_circle,
-                              color: Colors.white,
-                            ),
-                            onPressed: connectedDevice != null
-                                ? (isAcquiring
-                                      ? _stopAcquisition
-                                      : _startAcquisition)
-                                : null,
-                            tooltip: isAcquiring ? 'Stop ECG' : 'Start ECG',
-                            iconSize: 32,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              // Tab bar section
-              Container(
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.1),
-                  borderRadius: const BorderRadius.only(
-                    bottomLeft: Radius.circular(12),
-                    bottomRight: Radius.circular(12),
-                  ),
-                ),
-                child: AnimatedBuilder(
-                  animation: tabController,
-                  builder: (context, child) {
-                    return TabBar(
-                      controller: tabController,
-                      indicatorColor: Colors.white,
-                      indicatorWeight: 3,
-                      labelColor: Colors.white,
-                      unselectedLabelColor: Colors.white70,
-                      labelStyle: GoogleFonts.montserrat(
-                        fontWeight: FontWeight.w600,
-                        fontSize: 12,
-                      ),
-                      unselectedLabelStyle: GoogleFonts.montserrat(
-                        fontWeight: FontWeight.normal,
-                        fontSize: 12,
-                      ),
-                      tabs: [
-                        Tab(
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 200),
-                            curve: Curves.easeInOut,
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.grid_view,
-                                  size: 20,
-                                  color: tabController.index == 0
-                                      ? Colors.white
-                                      : Colors.white70,
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  '12-Lead ECG',
-                                  style: TextStyle(
-                                    color: tabController.index == 0
-                                        ? Colors.white
-                                        : Colors.white70,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        Tab(
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 200),
-                            curve: Curves.easeInOut,
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.show_chart,
-                                  size: 20,
-                                  color: tabController.index == 1
-                                      ? Colors.white
-                                      : Colors.white70,
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  'Single Lead',
-                                  style: TextStyle(
-                                    color: tabController.index == 1
-                                        ? Colors.white
-                                        : Colors.white70,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        Tab(
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 200),
-                            curve: Curves.easeInOut,
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.analytics,
-                                  size: 20,
-                                  color: tabController.index == 2
-                                      ? Colors.white
-                                      : Colors.white70,
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  'Analysis',
-                                  style: TextStyle(
-                                    color: tabController.index == 2
-                                        ? Colors.white
-                                        : Colors.white70,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ],
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
         ),
       ),
     );

@@ -36,6 +36,9 @@ dependencies:
   cupertino_icons: ^1.0.8
   bluetooth_classic: ^0.0.4
   google_fonts: ^6.3.1
+  path_provider: ^2.0.11
+  pdf: ^3.10.1
+  printing: ^5.10.0
 
 dev_dependencies:
   flutter_test:
