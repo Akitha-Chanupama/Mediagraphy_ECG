@@ -1,5 +1,5 @@
 name: ecg_bl
-description: "A new Flutter project."
+description: "Hospital-Grade ECG Monitoring Application with Advanced Filtering and Real-time Analysis"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -31,14 +31,28 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
+  # UI and Icons
   cupertino_icons: ^1.0.8
-  bluetooth_classic: ^0.0.4
   google_fonts: ^6.3.1
-  path_provider: ^2.0.11
-  pdf: ^3.10.1
-  printing: ^5.10.0
+  
+  # State Management
+  provider: ^6.1.2
+  
+  # Bluetooth Communication
+  bluetooth_classic: ^0.0.4
+  
+  # File System and Storage
+  path_provider: ^2.1.4
+  
+  # PDF Generation and Printing
+  pdf: ^3.11.1
+  printing: ^5.13.2
+  
+  # Data Processing and Math
+  collection: ^1.18.0
+  
+  # Utilities
+  intl: ^0.19.0
 
 dev_dependencies:
   flutter_test:
