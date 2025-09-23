@@ -4,7 +4,7 @@ A comprehensive Flutter application for real-time ECG monitoring with hospital-g
 
 ## 🏥 Medical-Grade Features
 
-### Advanced Signal Processin
+### Advanced Signal Processings
 - **Multi-stage Digital Filtering**: Butterworth high-pass, low-pass, and notch filters
 - **DC Offset Removal**: Baseline wander correction
 - **Power Line Interference Removal**: 50Hz/60Hz notch filtering
