@@ -112,7 +112,6 @@ extension ECGDataJson on ECGData {
     'V3': leadV3,
     'V4': leadV4,
     'V5': leadV5,
-    'V6': leadV6,
     'status1': status1,
     'status2': status2,
     'status3': status3,
